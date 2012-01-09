@@ -1,0 +1,72 @@
+#!/bin/bash
+declare -x PKGBUNDLE="$1"	# Full path to the install package.
+declare -x DSTROOT="$3"		# Installation Volume of mount point.
+declare -x SYSROOT="$4"		# The root directory for the system.
+
+declare -x chown="/usr/sbin/chown" chmod="/bin/chmod" cp="/bin/cp"
+declare -x rm="/bin/rm" hostname="/bin/hostname" srm="/usr/bin/srm"
+declare -x who="/usr/bin/who"
+
+declare -x BIND_NAME="dsmigrate"
+declare -x BIND_PATH="${DSTROOT:?}/usr/local/sbin"
+declare -x BIND="${BIND_PATH:?}/${BIND_NAME:?}"
+declare -x BIND_CONF="${BIND:?}.conf"
+declare -x BIND_PKG_CONF="${PKGBUNDLE:?}/Contents/Resources/${BIND_NAME:?}.conf"
+declare -x PLIST="${DSTROOT:?}/Library/LaunchDaemons/com.318.${BIND_NAME:?}.launchd.plist"
+
+printf "%s\n" "Checking for ${BIND_PKG_CONF:?}"
+if [ -f "${BIND:?}" ] ; then
+"$chown" 0:0 "${BIND:?}" &&
+	printf "%s\n" "Changed ownership 0:0 on ${BIND:?}"
+
+"$chmod" 700 "${BIND:?}" &&
+	printf "%s\n" "Changed file mode: 700 on ${BIND:?}"
+
+"$chown" -R 0:0 "${PLIST:?}" &&
+	printf "%s\n" "Changed ownership 0:0 on ${PLIST:?}"
+	
+"$chmod" -R 644 "${PLIST:?}" &&
+	printf "%s\n" "Changed permissions: 644 on ${PLIST:?}"
+else
+	printf "%s\n" "An error occurred"
+	printf "%s\n" "${BIND:?} is missing"
+	exit 1 
+fi
+
+
+if [ -f "${BIND_PKG_CONF:?}" ] ; then
+
+source "${BIND_PKG_CONF:?}"
+
+	if [ "${EXAMPLE}" = "Remove This Line" ] ; then
+		printf "%s\n"  "The Package still has the Example varible set"
+		exit 1
+	else
+	        printf "%s\n"  "Coping ${BIND_PKG_CONF:?} to ${BIND_PATH:?}/"
+		"$cp" -f "${BIND_PKG_CONF:?}" "${BIND_PATH:?}/"
+	fi
+fi
+migrateNow(){ 
+if [ "${DSTROOT:?}" == '/' ] ; then
+printf "%s\n" "Running in Active Mode"
+	"${BIND:?}" -u &&
+	[ -f "${PLIST:?}" ] &&
+		"$rm"  "${PLIST:?}"
+	[ -f "${BIND:?}" ] &&
+		"$rm"  "${BIND:?}"
+        [ -f "${BIND_CONF:?}" ] &&
+		"$srm"  "${BIND_CONF:?}"
+	# ABOVE: If we bound then remove all traces
+else
+printf "%s\n" "Running in passive mode"
+fi
+}
+declare CONSOLEUSER=$("$who" | "$awk" '$2~/console/{ print $1;exit}')
+# If their are not console users
+if [ ${#CONSOLEUSER} -eq 0 ] ; then
+	migrateNow
+fi
+
+bindNow
+
+exit 0

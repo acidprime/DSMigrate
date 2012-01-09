@@ -1,0 +1,588 @@
+#!/bin/bash
+#set -xv 
+# ABOVE: Enable for BASH debug
+[ "$EUID" != 0 ] && printf "%s\n" "This script requires root access ($EUID)!" && exit 1
+
+# Z1 needs add email support (sendEmail.pl) to statusmessage
+declare -x SCRIPT="${0##*/}" ; SCRIPTNAME="${SCRIPT%%\.*}"
+declare -x SCRIPTPATH="$0" RUNDIRECTORY="${0%/*}"
+declare -x CONFIGFILE="${RUNDIRECTORY:?}/${SCRIPTNAME}.conf"
+declare OD_USER="odjoin"
+declare OD_PASS="J01nOpen"
+
+if [ -r "${CONFIGFILE:?}" ] ; then
+        echo "Found configuration file: $CONFIGFILE"
+	source "${CONFIGFILE:?}"
+else
+	exit 1
+fi
+
+
+
+declare -ix EXCLUDE_UID="500"	# And lower
+declare -ix EXCLUDE_NON_MOBILE="YES"
+# Check to make sure AD binding is done
+
+
+# Required Commands
+declare -x awk="/usr/bin/awk"
+declare -x chown="/usr/sbin/chown"
+declare -x dscl="/usr/bin/dscl"
+declare -x defaults="/usr/bin/defaults"
+declare -x du="/usr/bin/du"
+declare -x id="/usr/bin/id"
+declare -x killall="/usr/bin/killall"
+declare -x ls="/bin/ls"
+declare -x mv="/bin/mv"
+declare -x mkdir="/bin/mkdir"
+declare -x osascript="osascript"
+declare -x srm="/usr/bin/srm"
+declare -x sleep="/bin/sleep"
+declare -x lookup="/usr/sbin/lookupd"
+declare -x dscacheutil="/usr/bin/dscacheutil"
+declare -x ipconfig="/usr/sbin/ipconfig"
+declare -x plutil="/usr/bin/plutil"
+declare -x ifconfig="/sbin/ifconfig"
+declare -x launchctl="/bin/launchctl"
+declare -x who="/usr/bin/who"
+# Optional Commands
+declare -x createmobileaccount=\
+"/System/Library/CoreServices/ManagedClient.app/Contents/Resources/createmobileaccount"
+declare -x mcxcacher="System/Library/CoreServices/mcxd.app/Contents/Resources/MCXCacher"
+declare -x SEARCH_PLIST="/Library/Preferences/DirectoryService/SearchNodeConfig.plist"
+
+# -- Runtime varibles
+declare -x REQCMDS="$awk $chown $dscl $defaults $du $mv $ntpdate $perl $scutil $killall"
+declare -x SCRIPT="${0##*/}" ; SCRIPTNAME="${SCRIPT%%\.*}"
+declare -x SCRIPTPATH="$0" RUNDIRECTORY="${0%/*}"
+declare -x SYSTEMVERSION="/System/Library/CoreServices/SystemVersion.plist"
+declare -x OSVER="$("$defaults" read "${SYSTEMVERSION%.plist}" ProductVersion )"
+#declare -x CONFIGFILE="${RUNDIRECTORY:?}/${SCRIPTNAME}.conf"
+declare -x BUILD_VERSION="20090609"
+declare PREF_PLIST="/Library/Preferences/com.318.${SCRIPTNAME:?}.plist"
+declare PREF_KEY="FirstRun"
+# -- Start the script log
+# Set to "VERBOSE" for more logging prior to using -v
+declare -x LOGLEVEL="NORMAL" SCRIPTLOG="/Library/Logs/${SCRIPT%%\.*}.log"
+
+declare -i CURRENT_LOG_SIZE="$("$du" -hm "${SCRIPTLOG:?}" |
+                                "$awk" '/^[0-9]/{print $1;exit}')"
+
+if [ ${CURRENT_LOG_SIZE:=0} -gt 50 ] ; then
+	"$rm" "$SCRIPTLOG"
+        statusMessage "LOGSIZE:$CURRENT_LOG_SIZE, too large removing"
+fi
+
+exec 2>>"${SCRIPTLOG:?}" # Redirect standard error to log file
+# Strip any extention from scriptname and log stderr to script log
+if [ -n ${SCRIPTLOG:?"The script log has not been specified"} ] ; then
+	printf "%s\n" \
+"STARTED:$SCRIPTNAME:EUID:$EUID:$("$date" +%H:%M:%S): Mac OS X $OSVER:BUILD:$BUILD_VERSION" >>"${SCRIPTLOG:?}"
+	printf "%s\n" "Log file is: ${SCRIPTLOG:?}"
+fi
+
+statusMessage() { # Status message function with type and now color!
+# Requires SCRIPTLOG STATUS_TYPE=1 STATUS_MESSAGE=2
+
+declare date="${date:="/bin/date"}"
+declare DATE="$("$date" -u "+%Y-%m-%d")"
+declare STATUS_TYPE="$1" STATUS_MESSAGE="$2"
+if [ "$ENABLE_COLOR" = "YES"  ] ; then
+	# Background Color
+	declare REDBG="41" WHITEBG="47" BLACKBG="40"
+	declare YELLOWBG="43" BLUEBG="44" GREENBG="42"
+	# Foreground Color
+	declare BLACKFG="30" WHITEFG="37" YELLOWFG="33"
+	declare BLUEFG="36" REDFG="31"
+	declare BOLD="1" NOTBOLD="0"
+	declare format='\033[%s;%s;%sm%s\033[0m\n'
+	# "Bold" "Background" "Forground" "Status message"
+	printf '\033[0m' # Clean up any previous color in the prompt
+else
+	declare format='%s\n'
+fi
+# Function only seems to work on intel and higher.
+showUIDialog(){
+statusMessage header "FUNCTION: #	$FUNCNAME" ; unset EXITVALUE TRY
+"$killall" -HUP "System Events" 2>/dev/null
+declare -x UIMESSAGE="$1"
+"$osascript" <<EOF
+try
+with timeout of 0.1 seconds
+	tell application "System Events"
+		set UIMESSAGE to (system attribute "UIMESSAGE") as string
+		activate
+			display dialog UIMESSAGE with icon 2 giving up after "3600" buttons "Dismiss" default button "Dismiss"
+		end tell
+	end timeout
+end try
+EOF
+return 0
+} # END showUIDialog()
+case "${STATUS_TYPE:?"Error status message with null type"}" in
+	progress) \
+	[ -n "$LOGLEVEL" ] &&
+	printf $format $NOTBOLD $WHITEBG $BLACKFG "PROGRESS:$STATUS_MESSAGE"  ;
+	printf "%s\n" "$DATE:PROGRESS: $STATUS_MESSAGE" >> "${SCRIPTLOG:?}" ;;
+	# Used for general progress messages, always viewable
+	
+	notice) \
+	printf "%s\n" "$DATE:NOTICE:$STATUS_MESSAGE" >> "${SCRIPTLOG:?}" ;
+	[ -n "$LOGLEVEL" ] &&
+	printf $format $NOTBOLD $YELLOWBG $BLACKFG "NOTICE  :$STATUS_MESSAGE"  ;;
+	# Notifications of non-fatal errors , always viewable
+	
+	error) \
+	printf "%s\n\a" "$DATE:ERROR:$STATUS_MESSAGE" >> "${SCRIPTLOG:?}" ;
+	[ -n "$LOGLEVEL" ] &&
+	printf $format $NOTBOLD $REDBG $YELLOWFG "ERROR   :$STATUS_MESSAGE"  ;;
+	# Errors , always viewable
+
+	verbose) \
+	printf "%s\n" "$DATE:VERBOSE: $STATUS_MESSAGE" >> "${SCRIPTLOG:?}" ;
+	[ "$LOGLEVEL" = "VERBOSE" ] &&
+	printf $format $NOTBOLD $WHITEBG $BLACKFG "VERBOSE :$STATUS_MESSAGE" ;;
+	# All verbose output
+	
+	header) \
+	[ "$LOGLEVEL" = "VERBOSE" ] &&
+	printf $format $NOTBOLD $BLUEBG $BLUEFG "VERBOSE :$STATUS_MESSAGE" ;
+	printf "%s\n" "$DATE:PROGRESS: $STATUS_MESSAGE" >> "${SCRIPTLOG:?}" ;;
+	# Function and section headers for the script
+	
+	passed) \
+	[ "$LOGLEVEL" = "VERBOSE" ] &&
+	printf $format $NOTBOLD $GREENBG $BLACKFG "SANITY  :$STATUS_MESSAGE" ;
+	printf "%s\n" "$DATE:SANITY: $STATUS_MESSAGE" >> "${SCRIPTLOG:?}" ;;
+	# Sanity checks and "good" information
+	graphical) \
+	[ "$GUI" = "ENABLED" ] &&
+	showUIDialog "$STATUS_MESSAGE" ;;
+	
+esac
+return 0
+} # END statusMessage()
+
+die() { # die Function
+statusMessage header "FUNCTION: #       $FUNCNAME" ; unset EXITVALUE
+declare LASTDIETYPE="$1" LAST_MESSAGE="$2" LASTEXIT="$3"
+declare LASTDIETYPE="${LASTDIETYPE:="UNTYPED"}"
+if [ ${LASTEXIT:="192"} -gt 0 ] ; then
+        statusMessage error "$LASTDIETYPE :$LAST_MESSAGE:EXIT:$LASTEXIT"
+        # Print specific error message in red
+else
+        statusMessage verbose "$LASTDIETYPE :$LAST_MESSAGE:EXIT:$LASTEXIT"
+        # Print specific error message in white
+fi
+	statusMessage verbose "COMPLETED:$SCRIPT IN $SECONDS SECONDS"
+	"$killall" "System Events"
+exit "${LASTEXIT}"      # Exit with last status or 192 if none.
+return 1                # Should never get here
+} # END die()
+
+
+cleanUp() { # -- Clean up of our inportant sessions variables and functions.
+statusMessage header "FUNCTION: #	$FUNCNAME" ; unset EXITVALUE
+statusMessage verbose "TIME: $SCRIPT ran in $SECONDS seconds"
+unset -f ${!check*}
+[ "${ENABLECOLOR:-"ENABLECOLOR"}" = "YES"  ] && printf '\033[0m' # Clear Color
+
+if [ "$PPID" == 1 ] ; then # LaunchD is always PID 1 in 10.4+
+	declare LAUNCHDITEM=$("$launchctl" list |
+	"$awk" -F'.' '$2!~/apple/{
+	scriptname=ENVIRON["SCRIPTNAME"]
+	# Pull the script name
+	if ( scriptname == $NF )
+	# If the last part of the domain matches the scriptname
+		{print $0;exit}}')
+	# Automatically find the scripts launchd item base on the script name	
+        
+	declare LDPLIST="${LAUNCHDITEM:?}.plist"
+	statusMessage progress "Self destructing: $CONFIGFILE"
+	[ -f "$CONFIGFILE" ] && "$srm" "${CONFIGFILE:?}"
+        
+	"$killall" -HUP 'System Events'
+	# ABOVE: To Restart the UI Messages on intel machines
+	if [ ${#LAUNCHDITEM} -gt 0 ] ; then
+	        statusMessage verbose "Ran as a startup item, unloading:$LDPLIST"
+		# BELOW: Good measure write the disabled key , just incase	
+	        "$defaults" write "/Library/LaunchDaemons/${LDPLIST}" Disabled -bool true
+		"$plutil" -convert xml1 "/Library/LaunchDaemons/${LDPLIST}"
+
+		"$mv" "/Library/LaunchDaemons/$LDPLIST" "/tmp/${LDPLIST:?}"
+		# BELOW : Unload the job from its new home.
+		"$launchctl" unload "/tmp/${LDPLIST:?}"
+	fi
+	statusMessage progress "Self destructing: $0"
+	"$srm" "$0"
+	# Good bye crule world
+fi
+declare CONSOLEUSER=$("$who" | "$awk" '$2~/console/{ print $1;exit}')
+# If their are not console users
+if [ ${#CONSOLEUSER} -eq 0 ] ; then
+	"$killall" -HUP 'loginwindow'
+fi
+# This will deselect the package in the bundle
+$defaults write "${PREF_PLIST%.plist}" "${PREF_KEY:?}" -bool false
+exec 2>&- # Reset the error redirects
+return 0
+} # END cleanUp()
+
+# Check script options
+statusMessage header "GETOPTS: Processing script $# options:$@"
+# ABOVE: Check to see if we are running as a postflight script,the installer  creates $SCRIPT_NAME
+[ $# = 0 ] && statusMessage verbose "No options given"
+# If we are not running postflight and no parameters given, print usage to stderr and exit status 1
+while getopts vCu SWITCH ; do
+        case $SWITCH in
+                v ) export LOGLEVEL="VERBOSE" ;;
+                C ) export ENABLE_COLOR="YES" ;;
+                u ) export GUI="ENABLED" ;;
+        esac
+done # END getopts
+
+checkCommands() { # CHECK_CMDS Required Commands installed check using the REQCMDS varible.
+declare -i FUNCSECONDS="$SECONDS" # Capture start time
+statusMessage header  "FUNCTION: #      ${FUNCNAME}" ; unset EXITVALUE
+declare REQCMDS="$1"
+for RQCMD in ${REQCMDS:?} ; do
+        if [  -x "$RQCMD" ] ; then
+                statusMessage passed "PASSED: $RQCMD is executable"
+        else
+        # Export the command Name to the die status message can refernce it"
+                export RQCMD ; return 1
+        fi
+        done
+return 0
+declare -i FUNCTIME=$(( ${SECONDS:?} - ${FUNCSECONDS:?} ))
+[ "${FUNCTIME:?}" != 0 ] &&
+statusMessage verbose "TIME:$FUNCNAME:Took $FUNCTIME seconds to EXIT:$EXITVALUE"
+} # END checkCommands()
+
+
+checkSystemVersion() { 
+# CHECK_OS Read the /Sys*/Lib*/CoreSer*/S*Version.plist value for OS version
+statusMessage header "FUNCTION: #	${FUNCNAME}" ; unset EXITVALUE
+declare OSVER="$1"
+case "${OSVER:?}" in
+	10.0* | 10.1* | 10.2* | 10.3*) \
+	die ERROR "$FUNCNAME: Unsupported OS version: $OSVER." 192 ;;
+
+	10.4*) \
+	statusMessage passed "CHECK_OS: OS check: $OSVER successful!";
+	return 0;;
+
+    	10.5*) \
+	statusMessage passed "CHECK_OS: OS check: $OSVER successful!";
+	return 0;;
+	
+	10.6*) \
+	die ERROR "$FUNCNAME:$LINENO Unsupported OS:$OSVER is too new." 192 ;;
+
+	*) \
+	die ERROR "CHECK_OS:$LINENO Unsupported OS:$OSVER unknown error" 192 ;;
+esac
+return 1
+} # END checkSystemVersion()
+
+withTimeOut(){ # Resuable timeout function (could be call withRetry instead)
+statusMessage header "FUNCTION: #	$FUNCNAME:$1:$2" ; unset EXITVALUE TRY
+declare COMMAND="$1" TIMEOUT="$2" STRING="$3"
+# Command to try, Number of trys and string to state at begining of re-loop.
+declare -i FUNCSECONDS="$SECONDS" # Capture start time
+until [ "${FUNCTIME:=0}" -ge "${TIMEOUT:?}" ]; do
+	declare EXITVALUE=1
+        declare -x TRYNUMBER=$(( ${TIMEOUT:?} - ${FUNCTIME:?} ))
+	"${COMMAND:?}" && declare EXITVALUE=0 && break
+	# The command is able to break the loop with a 0 return 
+	[  "$(( ${FUNCTIME:?} % 2 ))" = 0 ] && # Every other try display status
+		statusMessage notice "WAIT:$STRING:RETRY:$TRYNUMBER"
+	if [ "${FUNCTIME:=0}" -ge "${GTIMEOUT:?}" ] ; then
+		statusMessage error "Script reached global TIMEOUT $GTIMEOUT seconds"
+		declare EXITVALUE=1 ; break
+	fi
+	"$sleep" 1 # Wait one second before restarting the loop
+	declare -i FUNCTIME=$(( ${SECONDS:?} - ${FUNCSECONDS:?} ))
+done
+[ "${FUNCTIME:?}" != 0 ] &&
+statusMessage verbose "TIME:${FUNCNAME}:Took ${FUNCTIME} seconds to EXIT:${EXITVALUE:-1}"
+unset TRYNUMBER
+return "${EXITVALUE:-"1"}"
+} # END withTimeOut()
+
+checkNetwork() {
+statusMessage header "FUNCTION: #	$FUNCNAME" ; unset EXITVALUE
+declare -i FUNCSECONDS="$SECONDS" # Capture start time
+# Function required commands
+declare awk="${awk:="/usr/bin/awk"}"
+declare ipconfig="${ipconfig:="/usr/sbin/ipconfig"}"
+statusMessage progress "NETWORK: Begining network check..."
+statusMessage graphical \
+"Begining network check , ensure that machine is connected to the network and IP set"
+
+"$ipconfig" waitall # Block until the stack comes up, almost always exits 0
+
+for N in ${EN[@]} ; do # For all interfaces in the array such as 0,1,2
+	declare -a EN[N]=$("$ifconfig" en$N 2>/dev/null |
+	"$awk" 'BEGIN {}
+	$0~/\tmedia/{
+	# For current line, it tab media
+	if ( $NF == "inactive" )
+	{ print $NF ; exit 0 }
+	else if ( $NF == "active" )
+	{ print $NF; exit 1 }
+	}')
+	# Determine if Interface is active/inactive
+	declare -a MAC[N]=$("$ifconfig" "en$N" ether  2>/dev/null |
+	"$awk" 'BEGIN { FS="ether " }
+	/^\tether /{
+	ether=toupper($2)
+	# Convert MAC addess to uppercase
+	gsub(/:/,"",ether)
+	ether=substr(ether,7,12)
+	# Trunicate to 7 Charcters
+	gsub(" ","",ether)
+	# Remove any white space
+	print ether }
+	END { exit 0 }')
+	
+	[ $N = 0 ] && export EN0="${MAC[N]}"
+	statusMessage verbose "Found MAC on en$N : ${MAC[N]}"
+	
+	[ "${EN[N]}" = "inactive" ] &&
+	statusMessage notice "SKIP: en$N is ${EN[N]}" && continue
+	
+	declare -a IP[N]=$("$ipconfig" getifaddr "en$N" 2>/dev/null |
+	"$awk" 'BEGIN { FS="." }
+	$0~/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/{ ip=$0
+	# Regex the inet line, not a huge amount of validation.
+	if ( NF = 4 )
+		{ print ip }
+	# If the number of fields match then print
+	} END { exit 0 }')
+	# Determine en$N's IP address
+	
+	[[ "${IP[N]}" == 169.254.[0-9]*.[0-9]* ]] &&
+	statusMessage error "en$N has self assigned IP:${IP[N]}" && continue
+
+	statusMessage verbose "Found IP: ${IP[N]} on en$N"
+	if [ -n "$EN0" ] ; then # Overide automatic interface if $EN0 is not null
+		declare MAC="$EN0" # Always use name from EN0
+	else
+		declare MAC="${MAC[N]}"	# Use name from interface found first
+	fi
+	statusMessage progress "Using MAC string: ${MAC:?}"
+	statusMessage progress "Found IP: ${IP[N]} for site resolution"
+	
+	export IPADDR="${IP[$N]}" MACADDR="${MAC:?}" ENX="en$N"
+	[ -n "$IPADDR" ] || return 2
+	declare EXITVALUE="0"
+	break
+done
+
+declare -i FUNCTIME=$(( ${SECONDS:?} - ${FUNCSECONDS:?} ))
+[ "${FUNCTIME:?}" -gt 0 ] &&
+statusMessage verbose "TIME:$FUNCNAME:Took $FUNCTIME seconds to EXIT:$EXITVALUE"
+return ${EXITVALUE:-"1"}
+} # END checkNetwork()
+
+checkBinding(){ # Check AD binding by using the WINNT domain as lookup 10.4/10.5 
+statusMessage header "FUNCTION: #	$FUNCNAME" ; unset EXITVALUE TRY
+declare -i FUNCSECONDS="$SECONDS" ; unset  EXITVALUE # Capture start time
+declare FTIMEOUT="30"
+declare awk="${awk:="/usr/bin/awk"}" dscl="${dscl:="/usr/bin/dscl"}"
+declare id="${id:="/usr/bin/id"}" sleep="${sleep:="/bin/sleep"}"
+declare lookupd="${lookupd="/usr/sbin/lookupd"}"
+declare dscacheutil="${dscacheutil:="/usr/bin/dscacheutil"}"
+[ -x "$lookupd" ] && export oscacheutil="${lookupd}"
+[ -x "$dscacheutil" ] && export oscacheutil="${dscacheutil}"
+# 10.5 overide for dscacheutil
+if [ -z "${ODSERVER[CONFIG]}" ] ; then
+	statusMessage notice "Auto Detecting Open Directory binding"
+	declare -x ODSERVER="$($defaults read ${SEARCH_PLIST%.plist} "Search Node Custom Path Array" |
+                                        $awk -F"\"" '/LDAPv3/{print $2;exit}' |
+					$awk -F"/" '{print $NF; exit}')"
+else
+	declare -x ODSERVER="${ODSERVER[CONFIG]}"
+fi
+# Active Directory
+if [ "$ADBIND" = "YES" ] ; then
+until "$id" "${ADDOMNT:?}"\\"${ADBINDUDN:?}" &>/dev/null ; do 
+       let "TRY++"
+[ "${TRY}" = 2 ] &&
+	"$dscl" localhost changei /Search CSPSearchPath 1 "/Active Directory/${ADDOMAIN:?}"
+	if [ "${TRY:?}" -ge  "${FTIMEOUT:?}" ] ;  then
+	       	statusMessage error "Timed out using: \"$id ${ADDOMNT:?}\\\\${ADBINDUDN:?}\""
+       		declare ADEXIT=1 ; break
+
+       elif [ "${FUNCTIME:-0}" -ge "${GTIMEOUT:?}" ] ; then
+       		statusMessage error "verbose Script reached global GTIMEOUT $GTIMEOUT seconds"
+       		declare ADEXIT=1 ; break
+       fi
+	if [  "$(( ${TRY:-0} % 2 ))" = 0 ] ; then # Every other loop
+	statusMessage verbose "Waiting for user resolution:TRY:$(( ${FTIMEOUT} - ${TRY:-0} ))"
+	"$oscacheutil" -flushcache &&
+        statusMessage verbose "FLUSH: Cleared user lookup cache"
+	# Restart loop if successful in updating the index Number to 1 (top)
+	fi
+"$id" "${ADDOMNT:?}"\\"${ADBINDUDN:?}" &>/dev/null && break
+	"$sleep" 1 # If we did not break above, sleep and retry loop
+done
+else
+        declare ADEXIT=0
+	# Used if only configuring Active Directory
+fi
+# Open Directory
+if [ "$ODBIND" = "YES" ] ; then
+	declare ODEXIT="$("$dscl" "/LDAPv3/${ODSERVER}" read /Users/root  UniqueID |
+	"$awk" 'BEGIN{FS=": "}$2~/[0-9]+/{print "0"}')"
+# Much less complicated test for Open Directory, just find the LDAP root users UID
+[ "${ODEXIT:-1}" = 0 ] && statusMessage progress "Open Directory user resolution verified" 
+else
+	declare ODEXIT=0
+	# here in case we want to ditch OD as some point
+fi
+if "$id" "${ADDOMNT:?}"\\"${ADBINDUDN:?}" &>/dev/null ;  then
+	statusMessage passed "Active Directory binding verified!"
+	declare ADEXIT=0
+fi
+[ ${ADEXIT:-1 } = 0 -a "$ADBIND" = "YES" ] &&
+	statusMessage progress "Active Directory user resolution verified"
+declare -i FUNCTIME=$(( ${SECONDS:?} - ${FUNCSECONDS:?} ))
+[ "$FUNCTIME" != 0 ] &&
+statusMessage verbose "TIME:$FUNCNAME:Took $FUNCTIME seconds $EXITVALUE"
+return "$(( ${ODEXIT:-1} + ${ADEXIT:-1} ))" #If either fail its 1+, otherwise 0
+} # END checkBinding()
+
+firstRun(){
+declare PREF_PLIST="$1"
+declare PREF_KEY="$2"
+if [ ! -f "${PREF_PLIST:?}" ] ; then
+        echo debug "Creating Preference File"
+	$defaults write "${PREF_PLIST%.plist}" "${PREF_KEY:?}" -bool true
+fi
+}
+
+updateLaunchServices(){ # Update the launch services cache
+declare awk="${awk:="/usr/bin/awk"}"
+declare ls="${ls:="/bin/ls"}"
+declare -i USER_UID="$1" USER_AD_UID="$2" 
+for LSCACHE in /Library/Caches/com.apple.*.csstore ; do
+	declare -i OWNER_UID="$($ls -ln $LSCACHE | $awk '{print $3;exit}')"
+	[ $OWNER_UID != $USER_UID ] && continue
+	statusMessage verbose "Found: $LSCACHE owner:($OWNER_UID)"
+	$mv "${LSCACHE}" "${LSCACHE/$USER_UID/$USER_AD_UID}"
+	$chown "$USER_AD_UID" "${LSCACHE/$USER_UID/$USER_AD_UID}"	
+done
+}
+
+firstRun "${PREF_PLIST:?}" "${PREF_KEY:?}" 
+
+checkSystemVersion "${OSVER:?}" ||
+	die ERROR "LINENUM:$LINENO:Version Check failed" $(( 1<<5 | 18 ))
+
+checkCommands "${REQCMDS:?"ERROR: REQCMDS varible has not been set "}" ||
+	die ERROR "$SCRIPT: the command $RQCMD is not available, aborting" $(( 1<<5 | 19 )) 
+
+
+withTimeOut checkNetwork "${TIMEOUT:="60"}" "Waiting for network timeout"  ||
+	die NETWORK "LINENUM$LINENO:Unable to connect to network" $(( 1<<5 | 20 ))
+# Reset IP tables
+if [ -r "${CONFIGFILE:?}" ] ; then
+        echo "Found configuration file: $CONFIGFILE"
+	        source "${CONFIGFILE:?}"
+else
+       exit 1
+fi
+
+
+
+# check to make sure the user is not logged in, UI notification?
+	# launchd generation ? 
+# for loop with dscl . -list /Users/*
+declare -x AD_SEARCH_PATH="$($defaults read ${SEARCH_PLIST%.plist} "Search Node Custom Path Array" |
+					$awk -F"\"" '/Active Directory/{print $2;exit}')"
+
+declare -x GUESS_ADDOMNT="$(dscl "${AD_SEARCH_PATH:?}" -read / PrimaryNTDomain |
+					$awk '/^PrimaryNTDomain/{print $NF;exit}')"
+declare -x ADDOMNT="${ADDOMNT:="$GUESS_ADDOMNT"}"
+if [ -z "$ADDOMNT" ] ; then
+	die error "Unable to lookup Active Directory Binding Infomation"
+fi
+checkBinding ||  
+	statusMessage error "Binding Check failed, check LDAP root and $ADBINDUDN"
+
+# BELOW: List out all the local users, exlcuding built-ins like (root,nobody)
+statusMessage graphical "Beginning user converstion , please stay logged out or log out now"
+for USER_LIST in $($dscl . -list /Users | 
+		$awk '!/(^_|^Guest|^nobody|^root|^uucp|^daemon)/') ; do
+	statusMessage verbose "Processing user: $USER_LIST"
+	declare -ix USER_UID="$($id -u "$USER_LIST")"
+	# BELOW: if the UID is less than EXCLUDE_UID skip
+	[ "${USER_UID:?}" -lt "${EXCLUDE_UID:?}" ] && continue
+	
+	# Declare an array element based on userid value
+	declare -xa USER_NAME[$USER_UID]="$USER_LIST"
+	
+	# Read the NFSHomeDirectory and check it exists
+	declare -x USER_HOME="$($dscl . -read "/Users/${USER_LIST}" NFSHomeDirectory |
+				$awk '/^NFSHomeDirectory/{print $NF;exit}')"
+	if [ ! -d "$USER_HOME" ] ; then
+		statusMessage verbose "Missing Home Directory: $USER_HOME"
+		continue
+	fi
+
+	# Test the auth_auth for LocalCachedUser
+	declare -ix USER_IS_MOBILE="$(dscl . -read "/Users/${USER_NAME[$USER_UID]}" AuthenticationAuthority |
+	                                $awk '/LocalCachedUser.*/{++n}END{print n}')"
+	if [ "$USER_IS_MOBILE" -lt 1 ] ; then
+		if [ "$EXCLUDE_NON_MOBILE" = "YES" ] ; then
+			statusMessage notice \
+			"Skipping User: ${USER_NAME[$USER_UID]} non-mobile($USER_IS_MOBILE)"
+			continue	
+		fi
+	fi
+	statusMessage verbose "Found Home Directory: $USER_HOME"
+        statusMessage notice "Starting conversion for: ${USER_NAME[$USER_UID]}"
+
+	# This would fail if AD user does not exist 
+	declare -i USER_AD_UID="$($dscl "${AD_SEARCH_PATH}" -read "/Users/$USER_LIST" UniqueID |
+			$awk '/^UniqueID/{print $NF;exit}')"
+	
+	# This test would fail below if you are doing some hacky UID mapping
+	if [ $USER_AD_UID -eq 0 ] ; then
+		statusMessage error "User ID Lookup failure"
+		statusMessage error "AD: $AD_SEARCH_PATH User: $USER_LIST"
+		continue
+	fi
+# chown -R $USER_NAME
+	statusMessage graphical "Users are being converted on this system , please logout now"
+	$chown -R "${USER_AD_UID:?}":staff "${USER_HOME:?}" &&
+		statusMessage verbose \
+		"Changed ownership on $USER_HOME to uid :($USER_AD_UID)"
+	$dscl . -delete "/Users/${USER_NAME[$USER_UID]}" &&
+		statusMessage verbose \
+		"Deleted local domain user: ${USER_NAME[$USER_UID]}"
+	$oscacheutil -flushcache &&
+		statusMessage verbose "Flushed DirectoryService Cache"
+	$mkdir -p "/Users/${USER_NAME[$USER_UID]}/Library/Keychains Disabled"
+	$chown -R "/Users/${USER_NAME[$USER_UID]}/Library/Keychains Disabled"
+	$mv "/Users/${USER_NAME[$USER_UID]}/Library/Keychains"/* "/Users/${USER_NAME[$USER_UID]}/Library/Keychains Disabled/"
+	# BELOW: This test should always hopefully pass,
+	if [ "$($id -u ${USER_LIST:?})" -eq "${USER_AD_UID:?}" ] ; then
+
+		$createmobileaccount -vn "${USER_NAME[$USER_UID]}"	
+		$mcxcacher -U "${USER_NAME[$USER_UID]}"
+		declare LDAP_SERVER="$($dscl localhost -list /LDAPv3)"
+		# $dscl -u "$OD_USER" -P "$OD_PASS" "/LDAPv3/$LDAP_SERVER" -delete "/Users/${USER_NAME[$USER_UID]}"
+	else
+		statusMessage error "Unable to resolve $USER_LIST to UID:$USER_AD_UID"
+		continue
+	fi
+done
+statusMessage verbose "Processed user list: ${USER_NAME[*]}"
+# delete the od user
+cleanUp && exit 0
+# chown and rename the lauchservices file in /Library/Caches
+# Add certificate ( Seperate Package , part of main package )
+#  Update local nested local admin ( check for exsiting )

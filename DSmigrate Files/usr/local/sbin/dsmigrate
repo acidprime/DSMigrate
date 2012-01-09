@@ -1,0 +1,914 @@
+#!/bin/bash
+#set -xv
+# Created by Zack Smith zsmith@318.com zack@wallcity.org
+declare -x BUILD_VERSION="20100706"
+#set -xv 
+# ABOVE: Enable for BASH debug
+declare -ix LOCAL_USER_NAME_FIELD=1		# What field is the local username in the CSV
+declare -ix NETWORK_USER_NAME_FIELD=2	# What field is the network username in the CSV
+declare -ix COMPUTER_NAME_FIELD=3		# What field is the computername in the CSV
+
+declare -ix EXCLUDE_UID="200"	# Exclude this UID and lower
+declare -x EXCLUDE_MOBILE='NO' 	# Exclude mobile accounts?
+declare -x USER_NAME_MATCH='NO'	# Do the local and network names match?
+# Check to make sure AD binding is done
+
+
+[ "$EUID" != 0 ] &&
+		printf "%s\n" "This script requires root access ($EUID)!" && exit 1
+
+declare -x SCRIPT="${0##*/}" ; SCRIPTNAME="${SCRIPT%%\.*}"
+declare -x SCRIPTPATH="$0" RUNDIRECTORY="${0%/*}"
+declare -x CONFIG_FILE="${RUNDIRECTORY:?}/${SCRIPTNAME}.conf"
+
+# Required Commands
+declare -x awk="/usr/bin/awk"
+declare -x chown="/usr/sbin/chown"
+declare -x dscl="/usr/bin/dscl"
+declare -x defaults="/usr/bin/defaults"
+declare -x dscacheutil="/usr/bin/dscacheutil"
+declare -x du="/usr/bin/du"
+declare -x id="/usr/bin/id"
+declare -x killall="/usr/bin/killall"
+declare -x ls="/bin/ls"
+declare -x mv="/bin/mv"
+declare -x mkdir="/bin/mkdir"
+declare -x osascript="osascript"
+declare -x tr="/usr/bin/tr"
+declare -x srm="/usr/bin/srm"
+declare -x sleep="/bin/sleep"
+declare -x scutil="/usr/sbin/scutil"
+declare -x lookup="/usr/sbin/lookupd"
+declare -x dscacheutil="/usr/bin/dscacheutil"
+declare -x ipconfig="/usr/sbin/ipconfig"
+declare -x plutil="/usr/bin/plutil"
+declare -x ifconfig="/sbin/ifconfig"
+declare -x launchctl="/bin/launchctl"
+declare -x who="/usr/bin/who"
+# Conditional Command Assigments
+[ -x "$lookupd" ] &&
+	export oscacheutil="${lookupd}"
+[ -x "$dscacheutil" ] &&
+	export oscacheutil="${dscacheutil}"
+
+# Optional Commands
+declare -x createmobileaccount=\
+"/System/Library/CoreServices/ManagedClient.app/Contents/Resources/createmobileaccount"
+declare -x mcxcacher="System/Library/CoreServices/mcxd.app/Contents/Resources/MCXCacher"
+declare -x BigHonkingText="/usr/local/bin/BigHonkingText"
+declare -x SEARCH_PLIST="/Library/Preferences/DirectoryService/SearchNodeConfig.plist"
+
+# -- Runtime varibles
+declare -x REQCMDS="$awk $chown $dscl $defaults $du $mv $ntpdate $perl $scutil $killall $who"
+declare -x SCRIPT="${0##*/}" ; SCRIPTNAME="${SCRIPT%%\.*}"
+declare -x SCRIPTPATH="$0" RUNDIRECTORY="${0%/*}"
+declare -x CONFIG_FILE="${RUNDIRECTORY:?}/${SCRIPTNAME}.conf"
+declare -x SYSTEMVERSION="/System/Library/CoreServices/SystemVersion.plist"
+declare -x OSVER="$("$defaults" read "${SYSTEMVERSION%.plist}" ProductVersion )"
+declare -x PREF_DOMAIN="com.318"
+declare -x PREF_PLIST="/Library/Preferences/${PREF_DOMAIN:?}.${SCRIPTNAME:?}.plist"
+declare -x PREF_KEY="FirstRun"
+
+# -- Start the script log
+# Set to "VERBOSE" for more logging prior to using -v
+declare -x LOGLEVEL="NORMAL" SCRIPTLOG="/Library/Logs/${SCRIPT%%\.*}.log"
+
+declare -i CURRENT_LOG_SIZE="$("$du" -hm "${SCRIPTLOG:?}" |
+                                "$awk" '/^[0-9]/{print $1;exit}')"
+
+if [ ${CURRENT_LOG_SIZE:=0} -gt 50 ] ; then
+	"$srm" "$SCRIPTLOG"
+        printf "%s\n" "LOGSIZE:$CURRENT_LOG_SIZE, too large removing"
+fi
+
+exec 2>>"${SCRIPTLOG:?}" # Redirect standard error to log file
+# Strip any extention from scriptname and log stderr to script log
+if [ -n ${SCRIPTLOG:?"The script log has not been specified"} ] ; then
+	printf "%s\n" \
+"STARTED:$SCRIPTNAME:EUID:$EUID:$("$date" +%H:%M:%S): Mac OS X $OSVER:BUILD:$BUILD_VERSION" >>"${SCRIPTLOG:?}"
+	printf "%s\n" "Log file is: ${SCRIPTLOG:?}"
+fi
+showSystemEvents(){
+	"$killall" -HUP "System Events" 2>/dev/null
+	declare -x UIMESSAGE="$1"
+"$osascript" <<EOF
+try
+with timeout of 0.1 seconds
+	tell application "System Events"
+		set UIMESSAGE to (system attribute "UIMESSAGE") as string
+		activate
+			display dialog UIMESSAGE with icon 2 giving up after "3600" buttons "Dismiss" default button "Dismiss"
+		end tell
+	end timeout
+end try
+EOF
+	return 0
+}
+showHonkinText(){
+	declare -x UIMESSAGE="$1"
+	if [ -x $BigHonkingText ] ; then
+		$BigHonkingText -m "$UIMESSAGE" -p 0.7
+	fi
+}
+
+showUIDialog(){
+declare -x UIMESSAGE="$1"
+
+return 0
+} # END showUIDialog()
+
+statusMessage(){ # Status message function with type and now color!
+	# Requires SCRIPTLOG STATUS_TYPE=1 STATUS_MESSAGE=2
+
+	declare date="${date:="/bin/date"}"
+	declare DATE="$("$date" -u "+%Y-%m-%d")"
+	declare STATUS_TYPE="$1" STATUS_MESSAGE="$2"
+	if [ "$ENABLE_COLOR" = "YES"  ] ; then
+		# Background Color
+		declare REDBG="41" WHITEBG="47" BLACKBG="40"
+		declare YELLOWBG="43" BLUEBG="44" GREENBG="42"
+		# Foreground Color
+		declare BLACKFG="30" WHITEFG="37" YELLOWFG="33"
+		declare BLUEFG="36" REDFG="31"
+		declare BOLD="1" NOTBOLD="0"
+		declare format='\033[%s;%s;%sm%s\033[0m\n'
+		# "Bold" "Background" "Forground" "Status message"
+		printf '\033[0m' # Clean up any previous color in the prompt
+	else
+		declare format='%s\n'
+	fi
+	# Function only seems to work on intel and higher.
+
+	case "${STATUS_TYPE:?"Error status message with null type"}" in
+		progress) \
+		[ -n "$LOGLEVEL" ] &&
+		printf $format $NOTBOLD $WHITEBG $BLACKFG "PROGRESS:$STATUS_MESSAGE"  ;
+		showHonkinText "${STATUS_MESSAGE#:}" ;
+		printf "%s\n" "$DATE:PROGRESS: $STATUS_MESSAGE" >> "${SCRIPTLOG:?}" ;;
+		# Used for general progress messages, always viewable
+	
+		notice) \
+		printf "%s\n" "$DATE:NOTICE:$STATUS_MESSAGE" >> "${SCRIPTLOG:?}" ;
+		showHonkinText "${STATUS_MESSAGE#:}" ;
+		[ -n "$LOGLEVEL" ] &&
+		printf $format $NOTBOLD $YELLOWBG $BLACKFG "NOTICE  :$STATUS_MESSAGE"  ;;
+		# Notifications of non-fatal errors , always viewable
+	
+		error) \
+		printf "%s\n\a" "$DATE:ERROR:$STATUS_MESSAGE" >> "${SCRIPTLOG:?}" ;
+		showHonkinText "${STATUS_MESSAGE#:}" ;
+		printf "%s\n\a" "$DATE:ERROR:$STATUS_MESSAGE" >> "${SCRIPTLOG%%.log}.error.log" ;
+		[ -n "$LOGLEVEL" ] &&
+		printf $format $NOTBOLD $REDBG $YELLOWFG "ERROR   :$STATUS_MESSAGE"  ;;
+		# Errors , always viewable
+
+		verbose) \
+		printf "%s\n" "$DATE:VERBOSE: $STATUS_MESSAGE" >> "${SCRIPTLOG:?}" ;
+		showHonkinText "${STATUS_MESSAGE#:}" ;
+		[ "$LOGLEVEL" = "VERBOSE" ] &&
+		printf $format $NOTBOLD $WHITEBG $BLACKFG "VERBOSE :$STATUS_MESSAGE" ;;
+		# All verbose output
+	
+		header) \
+		[ "$LOGLEVEL" = "VERBOSE" ] &&
+		printf $format $NOTBOLD $BLUEBG $BLUEFG "VERBOSE :$STATUS_MESSAGE" ;
+		showHonkinText "${STATUS_MESSAGE#:}" ;
+		printf "%s\n" "$DATE:PROGRESS: $STATUS_MESSAGE" >> "${SCRIPTLOG:?}" ;;
+		# Function and section headers for the script
+	
+		passed) \
+		[ "$LOGLEVEL" = "VERBOSE" ] &&
+		printf $format $NOTBOLD $GREENBG $BLACKFG "SANITY  :$STATUS_MESSAGE" ;
+		showHonkinText "${STATUS_MESSAGE/*:/}" ;
+		printf "%s\n" "$DATE:SANITY: $STATUS_MESSAGE" >> "${SCRIPTLOG:?}" ;;
+		# Sanity checks and "good" information
+		
+		graphical) \
+		[ "$GUI" = "ENABLED" ] &&
+		showUIDialog "$STATUS_MESSAGE" ;;
+	
+	esac
+	return 0
+} # END statusMessage()
+
+die() { # die Function
+	statusMessage header "FUNCTION:       $FUNCNAME" ; unset EXITVALUE
+	declare LASTDIETYPE="$1" LAST_MESSAGE="$2" LASTEXIT="$3"
+	declare LASTDIETYPE="${LASTDIETYPE:="UNTYPED"}"
+	if [ ${LASTEXIT:="192"} -gt 0 ] ; then
+	        statusMessage "$LASTDIETYPE" "$LAST_MESSAGE:EXIT:$LASTEXIT"
+	        # Print specific error message in red
+	else
+	        statusMessage "$LASTDIETYPE" "$LAST_MESSAGE:EXIT:$LASTEXIT"
+	        # Print specific error message in white
+	fi
+		statusMessage verbose "COMPLETED:$SCRIPT IN $SECONDS SECONDS"
+	# Reset showUIDialog()
+	"$killall" "System Events"
+	exit "${LASTEXIT}"      # Exit with last status or 192 if none.
+	return 1                # Should never get here
+} # END die()
+
+
+cleanUp() { # -- Clean up of our inportant sessions variables and functions.
+	statusMessage header "FUNCTION: #	$FUNCNAME" ; unset EXITVALUE
+	statusMessage verbose "TIME: $SCRIPT ran in $SECONDS seconds"
+	unset -f ${!check*}
+	[ "${ENABLECOLOR:-"ENABLECOLOR"}" = "YES"  ] && printf '\033[0m' # Clear Color
+
+	if [ "$PPID" == 1 ] ; then # LaunchD is always PID 1 in 10.4+
+		declare LAUNCHDITEM=$("$launchctl" list |
+		"$awk" -F'.' '$2!~/apple/{
+		scriptname=ENVIRON["SCRIPTNAME"]
+		# Pull the script name
+		if ( scriptname == $NF )
+		# If the last part of the domain matches the scriptname
+			{print $0;exit}}')
+		# Automatically find the scripts launchd item base on the script name	
+        
+		declare LDPLIST="${LAUNCHDITEM:?}.plist"
+		statusMessage progress "Self destructing: $CONFIG_FILE"
+		[ -f "$CONFIG_FILE" ] && "$srm" "${CONFIG_FILE:?}"
+        
+		"$killall" -HUP 'System Events'
+		# ABOVE: To Restart the UI Messages on intel machines
+		if [ ${#LAUNCHDITEM} -gt 0 ] ; then
+		        statusMessage verbose "Ran as a startup item, unloading:$LDPLIST"
+			# BELOW: Good measure write the disabled key , just incase	
+		        "$defaults" write "/Library/LaunchDaemons/${LDPLIST}" Disabled -bool true
+			"$plutil" -convert xml1 "/Library/LaunchDaemons/${LDPLIST}"
+
+			"$mv" "/Library/LaunchDaemons/$LDPLIST" "/tmp/${LDPLIST:?}"
+			# BELOW : Unload the job from its new home.
+			"$launchctl" unload "/tmp/${LDPLIST:?}"
+		fi
+		statusMessage progress "Self destructing: $0"
+		"$srm" "$0"
+		# Good bye crule world
+	fi
+	declare CONSOLEUSER=$("$who" | "$awk" '$2~/console/{ print $1;exit}')
+	# If their are not console users
+	if [ ${#CONSOLEUSER} -eq 0 ] ; then
+		"$killall" -HUP 'loginwindow'
+	fi
+	# This will deselect the package in the bundle
+	$defaults write "${PREF_PLIST%.plist}" "${PREF_KEY:?}" -bool false
+	exec 2>&- # Reset the error redirects
+	return 0
+} # END cleanUp()
+
+showUsage(){
+	declare EXAMPLE_FILE="Users.csv"
+	printf "%s\n\t" "USAGE:"
+	printf "%s\n\t" 
+	printf "%s\n\t" " OUTPUT:"
+	printf "%s\n\t" " -v | # Turn on verbose output"
+	printf "\033[%s;%s;%sm%s\033[0m\n\t" "1" "44" "37" " -C | # Turn on colorized output"
+	printf "\033[0m"
+	printf "%s\n\t" " -u | # Turn on graphical display box support"
+	printf "%s\n\t" " -D | # Turn on debug (all function's name will be displayed at runtime)."
+
+	printf "%s\n\t" " OTHER TASKS:"
+	printf "%s\n\t" " -f | </path/to/$SCRIPT_NAME.conf>	# Read configuration from a conf file."
+	printf "%s\n\t" " -w | </path/to/$0.conf>	# Write configuration to a conf file."
+	printf "%s\n\t" " -p | # Print only -- Essentially a dry run"
+	printf "%s\n\t" " -h | # Print this usage message and quit"
+	printf "%s\n\t"
+	printf "%s\n\t" " EXAMPLE SYNTAX:"
+	printf "%s\n\t" " sudo $0 -Cv -f $EXAMPLE_FILE"
+	printf "%s\n"
+}
+
+# Check script options
+statusMessage header "GETOPTS: Processing script $# options:$@"
+# ABOVE: Check to see if we are running as a postflight script,the installer  creates $SCRIPT_NAME
+[ $# = 0 ] && statusMessage verbose "No options given"
+# If we are not running postflight and no parameters given, print usage to stderr and exit status 1
+while getopts vCupf:h SWITCH ; do
+        case "$SWITCH" in
+ 		v ) export LOGLEVEL="VERBOSE" ;;
+        C ) export ENABLECOLOR="YES" ;;
+        u ) export GUI="ENABLED" ;;
+        p ) export PRINT_ONLY="YES" ;;
+		f ) export CSV_FILE="$OPTARG" ;;
+		h ) showUsage && exit 0 ;;
+	esac
+done # END getopts
+
+
+startNewFunction(){
+	export FUNCTION_NAME="$1" #FUNCNAME
+	export FUNCTION_START="$2" # Capture start time
+	statusMessage header  "FUNCTION:      ${FUNCTION_NAME}"
+} # END startNewFunction()
+
+stopNewFunction(){
+	export FUNCTION_NAME="$1" #FUNCNAME
+	export FUNCTION_START="$2" # Capture start time
+	declare -i FUNCTION_TIME=$(( ${SECONDS:?} - ${FUNCSECONDS:?} ))
+	[ "${FUNCTION_TIME:?}" != 0 ] &&
+	statusMessage header "TIME:$FUNCTION_NAME:Took $FUNCTION_TIME seconds"
+} # END stopNewFunction()
+
+checkCommands() { # CHECK_CMDS Required Commands installed check using the REQCMDS varible.
+	startNewFunction  "${FUNCNAME}" "$SECONDS" ; unset EXITVALUE
+	declare REQCMDS="$1"
+	for RQCMD in ${REQCMDS:?} ; do
+	        if [  -x "$RQCMD" ] ; then
+	                statusMessage passed "PASSED: $RQCMD is executable"
+	        else
+	        # Export the command Name to the die status message can refernce it"
+	                export RQCMD ; return 1
+	        fi
+	        done
+	stopNewFunction "${FUNCNAME}" "$SECONDS"
+	return 0	
+} # END checkCommands()
+
+
+checkSystemVersion() { 
+	startNewFunction  "${FUNCNAME}" "${SECONDS}" ; unset EXITVALUE
+	declare OSVER="$1"
+	case "${OSVER:?}" in
+			10.0* | 10.1* | 10.2* | 10.3* | 10.4* ) \
+			die ERROR "$FUNCNAME: Unsupported OS version: $OSVER." 192 ;;
+
+			10.5*) \
+				statusMessage passed "CHECK_OS: OS check: $OSVER successful!";
+				return 0;;
+
+		    	10.6*) \
+				statusMessage passed "CHECK_OS: OS check: $OSVER successful!";
+				return 0;;
+	
+			10.7*) \
+				die ERROR "$FUNCNAME:$LINENO Unsupported OS:$OSVER is too new." 192 ;;
+
+			*) \
+				die ERROR "CHECK_OS:$LINENO Unsupported OS:$OSVER unknown error" 192 ;;
+	esac
+	stopNewFunction "${FUNCNAME}" "$SECONDS"
+	return 1
+} # END checkSystemVersion()
+
+withTimeOut(){ # Resuable timeout function (could be call withRetry instead)
+	startNewFunction  "${FUNCNAME}" "$SECONDS" ; unset EXITVALUE
+	declare COMMAND="$1" TIMEOUT="$2" STRING="$3"
+	# Command to try, Number of trys and string to state at begining of re-loop.
+	declare -i FUNCSECONDS="$SECONDS" # Capture start time
+	until [ "${FUNCTIME:=0}" -ge "${TIMEOUT:?}" ]; do
+		declare EXITVALUE=1
+	        declare -x TRYNUMBER=$(( ${TIMEOUT:?} - ${FUNCTIME:?} ))
+		"${COMMAND:?}" && declare EXITVALUE=0 && break
+		# The command is able to break the loop with a 0 return 
+		[  "$(( ${FUNCTIME:?} % 2 ))" = 0 ] && # Every other try display status
+			statusMessage notice "WAIT:$STRING:RETRY:$TRYNUMBER"
+		if [ "${FUNCTIME:=0}" -ge "${GTIMEOUT:?}" ] ; then
+			statusMessage error "Script reached global TIMEOUT $GTIMEOUT seconds"
+			declare EXITVALUE=1
+			break
+		fi
+		"$sleep" 1 # Wait one second before restarting the loop
+		declare -i FUNCTIME=$(( ${SECONDS:?} - ${FUNCSECONDS:?} ))
+	done # END until loop
+	unset TRYNUMBER
+	stopNewFunction  "${FUNCNAME}" "${SECONDS}"
+	return "${EXITVALUE:-"1"}"
+} # END withTimeOut()
+
+checkNetwork() {
+	startNewFunction  "${FUNCNAME}" "${SECONDS}" ; unset EXITVALUE
+	# Function required commands
+	declare awk="${awk:="/usr/bin/awk"}"
+	declare ipconfig="${ipconfig:="/usr/sbin/ipconfig"}"
+	statusMessage progress "NETWORK: Begining network check..."
+	statusMessage graphical \
+	"Begining network check , ensure that machine is connected to the network and IP set"
+
+	"$ipconfig" waitall # Block until the stack comes up, almost always exits 0
+
+	for N in ${EN[@]} ; do # For all interfaces in the array such as 0,1,2
+		declare -a EN[N]=$("$ifconfig" en$N 2>/dev/null |
+		"$awk" 'BEGIN {}
+		$0~/\tmedia/{
+		# For current line, it tab media
+		if ( $NF == "inactive" )
+		{ print $NF ; exit 0 }
+		else if ( $NF == "active" )
+		{ print $NF; exit 1 }
+		}')
+		# Determine if Interface is active/inactive
+		declare -a MAC[N]=$("$ifconfig" "en$N" ether  2>/dev/null |
+		"$awk" 'BEGIN { FS="ether " }
+		/^\tether /{
+		ether=toupper($2)
+		# Convert MAC addess to uppercase
+		gsub(/:/,"",ether)
+		ether=substr(ether,7,12)
+		# Trunicate to 7 Charcters
+		gsub(" ","",ether)
+		# Remove any white space
+		print ether }
+		END { exit 0 }')
+	
+		[ $N = 0 ] && export EN0="${MAC[N]}"
+		statusMessage verbose "Found MAC on en$N : ${MAC[N]}"
+	
+		[ "${EN[N]}" = "inactive" ] &&
+		statusMessage notice "SKIP: en$N is ${EN[N]}" && continue
+	
+		declare -a IP[N]=$("$ipconfig" getifaddr "en$N" 2>/dev/null |
+		"$awk" 'BEGIN { FS="." }
+		$0~/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/{ ip=$0
+		# Regex the inet line, not a huge amount of validation.
+		if ( NF = 4 )
+			{ print ip }
+		# If the number of fields match then print
+		} END { exit 0 }')
+		# Determine en$N's IP address
+	
+		[[ "${IP[N]}" == 169.254.[0-9]*.[0-9]* ]] &&
+		statusMessage error "en$N has self assigned IP:${IP[N]}" && continue
+
+		statusMessage verbose "Found IP: ${IP[N]} on en$N"
+		if [ -n "$EN0" ] ; then # Overide automatic interface if $EN0 is not null
+			declare MAC="$EN0" # Always use name from EN0
+		else
+			declare MAC="${MAC[N]}"	# Use name from interface found first
+		fi
+		statusMessage progress "Using MAC string: ${MAC:?}"
+		statusMessage progress "Found IP: ${IP[N]} for site resolution"
+	
+		export IPADDR="${IP[$N]}" MACADDR="${MAC:?}" ENX="en$N"
+		[ -n "$IPADDR" ] || return 2
+		declare EXITVALUE="0"
+		break
+	done
+
+	stopNewFunction  "${FUNCNAME}" "${SECONDS}"
+	return ${EXITVALUE:-"1"}
+} # END checkNetwork()
+
+
+checkLineEndings(){
+	startNewFunction  "${FUNCNAME}" "${SECONDS}" ; unset EXITVALUE
+	declare FILE_TO_CHECK="$1"
+	if [ -f "$FILE_TO_CHECK" ] ; then
+		if ! $perl -ne "exit 1 if m/\r\n/;" "$FILE_TO_CHECK" ; then
+			statusMessage notice \
+			"Incorrect line endings detected (probobly due to Mircosoft edit)"
+
+			statusMessage notice \
+			"Backup: $CSV_FILE.bak"
+	
+			$cp -f "$FILE_TO_CHECK" "$FILE_TO_CHECK".bak
+			statusMessage verbose 'Resetting line endings \r/\n/ to \n'
+
+			$perl -i -pe 's/\r/\n/g' "$FILE_TO_CHECK"
+		elif ! $perl -ne "exit 1 if m/\r/;" "$FILE_TO_CHECK" ; then
+
+			statusMessage notice \
+			"Incorrect line endings detected (DOS?) fixing backup: $FILE_TO_CHECK.bak"
+			$cp -f "$FILE_TO_CHECK" "$FILE_TO_CHECK".bak
+			
+			statusMessage verbose 'Resetting line endings \r/\n/'
+			$perl -i -pe 's/\r/\n/g' "$FILE_TO_CHECK"
+
+		fi
+	else
+		statusMessage error "File: $FILE_TO_CHECK does not exist"
+		die ERROR "Invalid file specified: $FILE_TO_CHECK"
+	fi
+	stopNewFunction  "${FUNCNAME}" "${SECONDS}"
+} # END checkLineEndings()
+
+firstRun(){
+	# First Run Function
+	startNewFunction  "${FUNCNAME}" "${SECONDS}" ; unset EXITVALUE
+	declare PREF_PLIST="$1"
+	declare PREF_KEY="FirstRun"
+	if [ ! -f "${PREF_PLIST:?}" ] ; then
+	        echo debug "Creating Preference File"
+		$defaults write "${PREF_PLIST%.plist}" "${PREF_KEY:?}" -bool true
+		return 0
+	else
+		return 1
+	fi
+	stopNewFunction  "${FUNCNAME}" "${SECONDS}"
+}
+
+updateLaunchServices(){ # Update the launch services cache
+	startNewFunction  "${FUNCNAME}" "${SECONDS}" ; unset EXITVALUE
+	declare awk="${awk:="/usr/bin/awk"}"
+	declare ls="${ls:="/bin/ls"}"
+	declare -i USER_UID="$1" USER_AD_UID="$2" 
+	for LSCACHE in /Library/Caches/com.apple.*.csstore ; do
+		declare -i OWNER_UID="$($ls -ln $LSCACHE | $awk '{print $3;exit}')"
+		if [ $OWNER_UID != $USER_UID ] ; then
+			statusMessage verbose \
+			"File: $LSCACHE ownership incorrect: $OWNER_UID/$USER_UID"
+			continue
+		fi
+		statusMessage verbose "Found: $LSCACHE owner:($OWNER_UID)"
+		$mv "${LSCACHE}" "${LSCACHE/$USER_UID/$USER_AD_UID}"
+		$chown "$USER_AD_UID" "${LSCACHE/$USER_UID/$USER_AD_UID}"	
+	done
+	stopNewFunction  "${FUNCNAME}" "${SECONDS}"
+}
+
+moveKeyChain(){
+	startNewFunction  "${FUNCNAME}" "${SECONDS}" ; unset EXITVALUE
+	
+	if [ ! -d "${NEW_HOME_DIRECTORY:?}/Library/Keychains Disabled" ] ; then
+		$mkdir -p "${NEW_HOME_DIRECTORY:?}/Library/Keychains Disabled"
+	else
+		statusMessage notice "${NEW_HOME_DIRECTORY:?}/Library/Keychains Disabled already exists!"
+	fi
+	statusMessahe verbose "Updating ownership on $NEW_HOME_DIRECTORY/Library/Keychains Disabled"
+	
+	$chown -R "${USER_NAME}" "${NEW_HOME_DIRECTORY:?}/Library/Keychains Disabled"
+	
+	statusMessahe verbose "Moving keychains to $NEW_HOME_DIRECTORY/Library/Keychains Disabled"
+	
+	$mv "${NEW_HOME_DIRECTORY:?}/Library/Keychains"/* "${NEW_HOME_DIRECTORY:?}/Library/Keychains Disabled/" ||
+		statusMessage error "An error might have occured moving the keychain file(s)"
+	
+	stopNewFunction  "${FUNCNAME}" "${SECONDS}"
+}
+
+checkHomeExists(){
+	startNewFunction  "${FUNCNAME}" "${SECONDS}" ; unset EXITVALUE
+	declare USER_NAME="$1"
+	# Read the NFSHomeDirectory and check it exists
+	export USER_HOME="$($dscl . -read "/Users/${USER_NAME}" NFSHomeDirectory |
+				$awk '/^NFSHomeDirectory/{print $NF;exit}')"
+	# Run Test
+	if [ ! -d "$USER_HOME" ] ; then
+		statusMessage verbose "Missing Home Directory: $USER_HOME"
+		stopNewFunction  "${FUNCNAME}" "${SECONDS}"
+		return 1
+	else
+		statusMessage verbose "Found Home Directory: $USER_HOME"
+		stopNewFunction  "${FUNCNAME}" "${SECONDS}"
+		return 0
+	fi
+	stopNewFunction  "${FUNCNAME}" "${SECONDS}"
+	return 1
+}
+
+checkIfMobile(){ 
+	startNewFunction  "${FUNCNAME}" "${SECONDS}" ; unset EXITVALUE
+	declare USER_NAME="$1"
+	# Test the AuthenticationAuthority for LocalCachedUser to see if Mobile
+	export USER_IS_MOBILE="$($dscl . -read "/Users/${USER_NAME:?}" AuthenticationAuthority |
+				$awk '/LocalCachedUser.*/{++n}END{print n}')"
+				
+	# Run Test
+	if [ "$USER_IS_MOBILE" -gt 1 ] ; then	
+			statusMessage verbose "User ${USER_NAME:?} is already a mobile account"
+			return 1
+	else
+			statusMessage verbose "User ${USER_NAME:?} is NOT a mobile account"
+			return 0
+	fi
+	stopNewFunction  "${FUNCNAME}" "${SECONDS}"
+} # END checkIfMobile()
+
+setRunTimeValues(){
+	startNewFunction  "${FUNCNAME}" "${SECONDS}" ; unset EXITVALUE
+	export AD_SEARCH_PATH="$($defaults read ${SEARCH_PLIST%.plist} "Search Node Custom Path Array" |
+						$awk -F"\"" '/Active Directory/{print $2;exit}')"
+
+	statusMessage verbose "Found AD Search Path: $AD_SEARCH_PATH"
+
+
+	export GUESS_ADDOMNT="$($dscl "${AD_SEARCH_PATH:?}" -read / PrimaryNTDomain |
+						$awk '/^PrimaryNTDomain/{print $NF;exit}')"
+
+	statusMessage verbose "Found AD NT Domain: $GUESS_ADDOMNT"
+
+	export ADDOMNT="${ADDOMNT:="$GUESS_ADDOMNT"}"
+	
+	[ -z "$ADDOMNT" ] && 
+			die error "Unable to lookup Active Directory Binding Infomation"
+	stopNewFunction  "${FUNCNAME}" "${SECONDS}"
+} # END setRunTimeValues()
+	
+checkForConsoleUsers(){
+	startNewFunction  "${FUNCNAME}" "${SECONDS}" ; unset EXITVALUE
+	# This function requires the following commands:
+	declare who="${who:="/usr/bin/who"}"
+	declare awk="${awk:="/usr/bin/awk"}"
+	
+	declare CONSOLE_USERS="$($who |
+			$awk '$2~/console/{ print $1;exit}')"
+
+	# Run the Test
+	if [ ${#CONSOLEUSER} -eq 0 ] ; then
+		statusMessage graphical "Please wait to login"
+	else
+		statusMessage graphical "Please logout now"
+	fi
+	stopNewFunction  "${FUNCNAME}" "${SECONDS}"
+} # END checkForConsoleUsers()
+
+# Getters and Setters
+
+getLocalHomePath(){
+        declare USER_TO_CHECK="$1"
+	$dscl . -read "/Users/${USER_TO_CHECK:?}" NFSHomeDirectory |
+				$awk '/NFSHomeDirectory/{print $NF;exit}'	
+} # END getLocalHomePath()
+
+getUIDforUser(){
+	declare USER_TO_CHECK="$1"
+	$id -u "${USER_TO_CHECK:?}" 
+} # END getUIDforUser()
+
+getUIDforNetworkUser(){
+	declare USER_NAME="$1"
+	# This would fail if AD user does not exist 
+	export USER_AD_UID="$($dscl "${AD_SEARCH_PATH}" -read "/Users/$USER_NAME" UniqueID |
+			$awk '/^UniqueID/{print $NF;exit}')"
+	print "%s\n" "$USER_AD_UID"
+}
+
+# End Getters and Setters
+
+changeOwnerShip(){
+	startNewFunction  "${FUNCNAME}" "$SECONDS" ; unset EXITVALUE
+	declare NETWORK_UID="$1"
+	declare LOCAL_HOME="$2"
+	if $chown -R "${NETWORK_UID:?}":staff "${LOCAL_HOME:?}" ; then
+		statusMessage verbose \
+		"Changed ownership on $LOCAL_HOME to uid :($NETWORK_UID)"
+		return 0
+	else
+		statusMessage error \
+		"Failed to change ownership on $LOCAL_HOME to uid :($NETWORK_UID)"
+		return 1
+	fi
+	stopNewFunction  "${FUNCNAME}" "$SECONDS"
+}
+
+deleteLocalUser(){
+	startNewFunction  "${FUNCNAME}" "$SECONDS" ; unset EXITVALUE
+	declare USER_NAME="$1"
+	if $dscl . -delete "/Users/${USER_NAME}" ; then
+		statusMessage verbose "Deleted local user: ${USER_NAME}"
+	else
+		statusMessage error "Unable to delete local user: ${USER_NAME}"
+	fi
+	stopNewFunction  "${FUNCNAME}" "$SECONDS"
+}
+
+renameHomeDirectory(){
+	startNewFunction  "${FUNCNAME}" "$SECONDS" ; unset EXITVALUE
+	# This function requires the following commands:
+	export dirname="${dirname:="/usr/bin/dirname"}"
+	export basename="${basename:="/usr/bin/basename"}"
+	# Postitional Parameters
+	declare USER_NAME="$1"
+	declare NETWORK_USER_NAME="$2"
+	declare LOCAL_HOME="$3"
+	# Run Test
+	
+	if [ ! -d "$USERS_DIRECTORY" ] ; then
+		statusMessage error "Users Directory Folder $USERS_DIRECTORY does not exist!"
+		return 1
+	fi
+	
+	if [ "$USER_NAME" = "$NETWORK_USER_NAME" ] ; then
+		statusMessage notice "Usernames are the same, home directory does not need to be renamed"
+		return 0
+	fi
+	
+	if [ ! -d "$LOCAL_HOME" ] ; then
+		statusMessage error "User Home Directory $LOCAL_HOME does not exist!"
+		return 1
+	fi
+	if [ -d "$NEW_HOME_DIRECTORY" ] ; then
+		statusMessage error "Home Directory $NEW_HOME_DIRECTORY already exists"
+		die error "Home Directory: $NEW_HOME_DIRECTORY already exits!"
+	fi
+	if $mv "$LOCAL_HOME" "$NEW_HOME_DIRECTORY" ; then
+		statusMessage passed "Renamed old home directory ($LOCAL_HOME->$NEW_HOME_DIRECTORY)"
+	else
+		statusMessage error "Error moving old home directory ($LOCAL_HOME->$NEW_HOME_DIRECTORY)"
+		return 1
+	fi
+	stopNewFunction  "${FUNCNAME}" "$SECONDS"
+}
+
+flushDirectoryService(){
+	startNewFunction  "${FUNCNAME}" "$SECONDS" ; unset EXITVALUE
+	if $oscacheutil -flushcache ; then
+		statusMessage verbose "Flushed DirectoryService Cache"
+	fi
+	stopNewFunction  "${FUNCNAME}" "$SECONDS"
+}
+
+createMobileAccount(){
+	startNewFunction  "${FUNCNAME}" "$SECONDS" ; unset EXITVALUE
+	declare USER_NAME="$1"
+	if [ -f "$createmobileaccount" ] ; then
+		$createmobileaccount -vn "${USER_NAME:?}"
+	else
+		$mcxcacher -U "${USER_NAME:?}"
+	fi
+	stopNewFunction  "${FUNCNAME}" "$SECONDS"
+}
+
+checkForExcludedUID(){
+	startNewFunction  "${FUNCNAME}" "$SECONDS" ; unset EXITVALUE
+	declare -i LOCAL_UID="$1"
+	declare -i EXCLUDE_UID="$2"
+	if [ "${LOCAL_UID:?}" -le "${EXCLUDE_UID:?}" ] ; then
+		statusMessage notice \
+		"Skipping $USER_NAME as thier UID ($LOCAL_UID) is below $EXCLUDE_UID"
+		continue
+	fi
+	stopNewFunction  "${FUNCNAME}" "$SECONDS"
+}
+
+validateLoopVars(){
+	startNewFunction  "${FUNCNAME}" "$SECONDS" ; unset EXITVALUE
+	declare -i X=0
+	for N in $@ ; do
+		declare -i X=$(($N + $X))
+	done
+	if [ $X -le $# ] ; then
+		statusMessage "Values missing from loop variables"
+	fi
+	stopNewFunction  "${FUNCNAME}" "$SECONDS"
+}
+
+setDryRunValues(){
+	export dscl="echo dscl"
+	export rm="echo rm"
+	export srm="echo srm"
+	export mv="echo mv"
+	
+}
+# Begin Main Routine
+
+if [ "$PRINT_ONLY" = YES ] ; then
+	setDryRunValues
+fi
+
+# Run our first run functions
+firstRun  "${PREF_PLIST:?}" "${PREF_KEY:?}" && 
+	checkSystemVersion "${OSVER:?}" ||
+		die error "LINENUM$LINENO:$SCRIPT: Version Check failed" 18
+firstRun  "${PREF_PLIST:?}" "${PREF_KEY:?}" && 
+	checkCommands "${REQCMDS:?"ERROR: REQCMDS varible has not been set "}" ||
+		die error "LINENUM$LINENO:$SCRIPT: the command $RQCMD is not available, aborting" 19
+
+withTimeOut checkNetwork "${TIMEOUT:="60"}" "Waiting for network timeout"  ||
+	die error "LINENUM$LINENO:$SCRIPT: Unable to connect to network" 20
+
+setRunTimeValues ||
+	die error "LINENUM$LINENO:$SCRIPT: Setting runtime values failed" 21
+
+# BELOW: List out all the local users, exlcuding built-ins like (root,nobody)
+statusMessage graphical "Please wait to login"
+
+declare -x DSCL_LOCAL_USERS="$($dscl . -list /Users | 
+		$awk '!/(^_|^Guest|^nobody|^root|^uucp|^daemon|^com.apple.*)/')"
+		
+declare -x USER_LIST="$DSCL_LOCAL_USERS"
+
+# -- Get the current comptername and ensure its upper case
+export COMPUTER_NAME="$($scutil --get ComputerName | $tr '[:lower:]' '[:upper:]')"
+
+statusMessage verbose "Found Computer Name: $COMPUTER_NAME"
+
+OLDIFS="$IFS"
+IFS=$'\n'
+for LINE in `$cat "${CSV_FILE:?"Must specify a file with -f"}"` ; do
+	let LINE_NUM++
+	if  [ $LINE_NUM -eq 1 ] ; then
+		statusMessage progress "Skipping first line:$LINE"
+		continue
+	fi
+	
+	# Gather values from CSV postions defined at top of script
+	declare CSV_LOCAL_USER_NAME="$(printf "%s" |
+			$awk -F',' -v field="$LOCAL_USER_NAME_FIELD" '{print $field;exit}')"
+			
+	declare CSV_NETWORK_USER_NAME="$(printf "%s" |
+			$awk -F',' -v field="$NETWORK_USER_NAME_FIELD" '{print $field;exit}')"
+			
+	declare CSV_COMPUTER_NAME="$(printf "%s" |
+			$awk -F',' -v field="$COMPUTER_NAME_FIELD" '{print $field;exit}')"
+
+	declare -i CSV_LOCAL_UID="$(getUIDforUser "${CSV_NETWORK_USER_NAME:?}")"
+
+	if validateLoopVars ${#CSV_LOCAL_USER_NAME} ${#CSV_NETWORK_USER_NAME} ${#CSV_COMPUTER_NAME} ${#CSV_LOCAL_UID}
+	then
+		statusMessage passed "Runtime values passed minimum character inspection"
+	else
+		statusMessage error "Runtime values failed minimum character inspection"
+		continue
+	fi
+
+	if [ "$CSV_LOCAL_UID" -eq 0 ] ; then
+		statusMessage error "Directory Service lookup failure for $CSV_LOCAL_USER_NAME"
+		continue
+	fi
+	if [ "$CSV_COMPUTER_NAME" = "$COMPUTER_NAME" ] ; then
+		statusMessage passed "Found Match for ComputerName $CSV_COMPUTER_NAME"
+	else
+		# No echo here as it would show too many failures
+		continue
+	fi
+	declare -xa CSV_NETWORK_USER_NAME["$CSV_LOCAL_UID"]="$CSV_NETWORK_USER_NAME"
+done
+OLDIFS="$IFS"
+
+for USER_NAME in $USER_LIST ; do
+			
+	statusMessage verbose "Processing user: $USER_NAME"
+	
+	# Setup The Loop Variables 
+	
+	declare -ix LOCAL_UID="$(getUIDforUser "${USER_NAME:?}")"
+
+	declare -ix NETWORK_UID="$(getUIDforNetworkUser "${USER_NAME:?}")"
+
+	declare -x  LOCAL_HOME="$(getLocalHomePath "${USER_NAME:?}")"
+	
+	declare -x  USERS_DIRECTORY="$($dirname ${LOCAL_HOME:?})"
+	
+	if validateLoopVars ${#LOCAL_UID} ${#NETWORK_UID} ${#LOCAL_HOME} ${#USERS_DIRECTORY}
+	then
+		statusMessage passed "Runtime values passed minimum character inspection"
+	else
+		statusMessage error "Runtime values failed minimum character inspection"
+		continue
+	fi
+	
+	# Condtional Variables
+	
+	if [ "$USER_NAME_MATCH" = 'YES' ] ; then
+		statusMessage "Proceeding on the assumption that L/N user names match"
+		declare -x  NETWORK_USER_NAME="$USER_NAME"
+	else
+		statusMessage "Using CSV file to derive names"
+		declare -x NETWORK_USER_NAME="${CSV_NETWORK_USER_NAME[$LOCAL_UID]}"
+	fi
+	
+	if [ "$NETWORK_USER_NAME" -lt 1 ] ; then
+		statusMessage error "$USER_NAME with uid $LOCAL_UID not found in $CSV_FILE"
+		continue
+	fi
+	declare -x  NEW_HOME_DIRECTORY="$USERS_DIRECTORY/${NETWORK_USER_NAME:?}"
+
+	declare -xa USER_NAME[$LOCAL_UID]="$USER_NAME"
+
+	# BELOW: if the UID is less than or equal to EXCLUDE_UID skip
+	checkForExcludedUID "$LOCAL_UID" "$EXCLUDE_UID"
+	
+	checkHomeExists "$USER_NAME" || continue # Exports USER_HOME
+
+	checkIfMobile "$USER_NAME" || continue
+	
+	statusMessage notice "Starting conversion for: ${USER_NAME}"
+	
+	# This test would fail below if you are doing some hacky UID mapping
+	if [ "$NETWORK_UID" -eq 0 ] ; then
+		statusMessage error "User ID Lookup failure"
+		statusMessage error "AD: $AD_SEARCH_PATH User: $USER_ITEM"
+		continue
+	fi
+
+	checkForConsoleUsers
+
+	changeOwnerShip "$NETWORK_UID" "$LOCAL_HOME"
+	
+	checkForConsoleUsers
+
+	deleteLocalUser "$USER_NAME"
+	
+	checkForConsoleUsers
+
+	renameHomeDirectory "$USER_NAME" "$NETWORK_USER_NAME" "$LOCAL_HOME" ||
+		die error "Error renaming home directory for user: $USER_NAME"
+	
+	flushDirectoryService
+	
+	moveKeyChain "${NEW_HOME_DIRECTORY}" ||
+			die error "Keychain Move Failed."
+
+	# BELOW: This test should always hopefully pass
+		
+	updateLaunchServices "$LOCAL_UID" "$NETWORK_UID"
+	
+	createMobileAccount "$USER_NAME" ||
+			die error "User creation failed."
+	
+	checkForConsoleUsers
+done
+statusMessage verbose "Processed user list: ${USER_NAME[*]}"
+
+cleanUp && exit 0
